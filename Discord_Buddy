@@ -1,0 +1,85 @@
+# file: trading_edu_bot.py
+import os, asyncio
+import discord
+from discord import app_commands
+from openai import OpenAI
+
+# ---- Config ----
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GUILD_ID = os.getenv("GUILD_ID")  # optional: speed up command registration
+
+client_oai = OpenAI(api_key=OPENAI_API_KEY)
+
+SYSTEM_PROMPT = """You are a calm, accurate trading educator for beginners and intermediates.
+Explain clearly with short examples and equations where helpful.
+Avoid giving personalized financial advice. Include a one-line TL;DR at the end.
+When asked 'what is X', define it, show why it matters, and a tiny example.
+If a question could be risky advice, add a brief caution."""
+
+# ---- Discord bot with slash commands ----
+class EduBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)  # faster local sync during development
+        else:
+            await self.tree.sync()
+
+bot = EduBot()
+
+@bot.tree.command(name="ask", description="Ask a trading question (indicators, terms, mechanics).")
+@app_commands.describe(question="Your question, e.g., 'Explain MACD like I'm 12.'")
+async def ask(interaction: discord.Interaction, question: str):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        resp = client_oai.responses.create(
+            model="gpt-4o",  # or your preferred model
+            instructions=SYSTEM_PROMPT,
+            input=[
+                {
+                    "role": "user",
+                    "content": f"User question: {question}\n\nConstraints: 150-250 words when possible."
+                }
+            ],
+        )
+        answer = resp.output_text  # unified Responses API output
+        # Soft guardrail footer (keeps you on the right side of “education, not advice”)
+        footer = "\n\n*Educational only — not investment advice.*"
+        await interaction.followup.send(answer + footer)
+    except Exception as e:
+        await interaction.followup.send(f"Sorry, I hit an error: `{e}`")
+
+# (Optional) quick price command
+try:
+    import yfinance as yf
+    @bot.tree.command(name="price", description="Get a quick last price and daily change for a ticker.")
+    @app_commands.describe(ticker="e.g., AAPL, TSLA, SPY")
+    async def price(interaction: discord.Interaction, ticker: str):
+        await interaction.response.defer(thinking=True)
+        try:
+            t = yf.Ticker(ticker.upper())
+            info = t.fast_info  # fast snapshot
+            last = float(info["last_price"])
+            prev_close = float(info["previous_close"])
+            pct = (last/prev_close - 1.0) * 100.0 if prev_close else 0.0
+            await interaction.followup.send(f"**{ticker.upper()}** ${last:,.2f} ({pct:+.2f}%)")
+        except Exception as e:
+            await interaction.followup.send(f"Couldn’t fetch {ticker}: `{e}`")
+except Exception:
+    # yfinance not installed; ignore the command at runtime
+    pass
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        raise RuntimeError("Set DISCORD_TOKEN in your environment.")
+    if not OPENAI_API_KEY:
+        print("Warning: OPENAI_API_KEY not set — /ask will fail.")
+    bot.run(DISCORD_TOKEN)
